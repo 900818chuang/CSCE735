@@ -10,7 +10,7 @@
 #include <limits.h>
 
 #define MAX_THREADS     65536
-#define MAX_LIST_SIZE   100000000
+#define MAX_LIST_SIZE   268435460
 
 #define DEBUG 0
 
@@ -19,6 +19,16 @@
 // VS: ... declare thread variables, mutexes, condition varables, etc.,
 // VS: ... as needed for this assignment 
 //
+typedef struct Thread_data{
+    int q;
+    int index;
+}thread_data;
+
+pthread_t p_threads[MAX_THREADS];
+pthread_cond_t cond_copy, cond_next, cond_start;
+pthread_mutex_t lock_copy, lock_next, lock_start;
+int copy_count = 0, next_count = 0, start_count = 0;
+
 
 // Global variables
 int num_threads;		// Number of threads to create - user input 
@@ -109,6 +119,93 @@ int binary_search_le(int v, int *list, int first, int last) {
 //
 // VS: ... to be parallelized using threads ...
 //
+void* sort_list_parallel(void* data) {
+    thread_data* my_data = (thread_data*)data;  // my_data
+    int my_thread_id = my_data->index;  // Thread ID
+    int my_merge_level = my_data->q;    // Current merge level
+    int my_segment_size = list_size / num_threads;  // Segment size per thread
+    int my_segment_start = my_thread_id * my_segment_size;  // Start of segment
+    int my_segment_end = (my_thread_id + 1) * my_segment_size;  // End of segment
+    int my_current_start = my_segment_start;  // Current start for merging
+    int my_current_end = my_segment_end;      // Current end for merging
+    int my_index;  // Index for loop
+
+
+    // Sort local list
+    qsort(&list[my_thread_id * my_segment_size], my_segment_size, sizeof(int), compare_int);
+
+    // Synchronization for start phase
+    pthread_mutex_lock(&lock_start);
+    start_count++;
+    if (start_count == num_threads) {
+        start_count = 0;
+        pthread_cond_broadcast(&cond_start);
+    }
+    else {
+        pthread_cond_wait(&cond_start, &lock_start);
+    }
+    pthread_mutex_unlock(&lock_start);
+
+    // Merge at each level
+    while (my_merge_level != 0) {
+        if (my_thread_id % 2 == 0) {
+            // Left half merge
+            for (my_index = my_segment_start; my_index < my_segment_end; my_index++) {
+                int my_binary_result = binary_search_lt(list[my_index], list, my_current_start + my_segment_size, my_current_end + my_segment_size);
+                my_binary_result -= (my_current_start + my_segment_size);
+                work[my_index + my_binary_result] = list[my_index];
+            }
+            my_current_end += my_segment_size;
+        }
+        else {
+            // Right half merge
+            for (my_index = my_segment_start; my_index < my_segment_end; my_index++) {
+                int my_binary_result = binary_search_le(list[my_index], list, my_current_start - my_segment_size, my_current_end - my_segment_size);
+                my_binary_result -= (my_current_start - my_segment_size);
+                work[my_index - my_segment_size + my_binary_result] = list[my_index];
+            }
+            my_current_start -= my_segment_size;
+        }
+
+        my_thread_id /= 2;
+        my_segment_size *= 2;
+        my_merge_level--;
+
+        // Synchronization for copy phase
+        pthread_mutex_lock(&lock_copy);
+        copy_count++;
+        if (copy_count == num_threads) {
+            copy_count = 0;
+            pthread_cond_broadcast(&cond_copy);
+        }
+        else {
+            pthread_cond_wait(&cond_copy, &lock_copy);
+        }
+        pthread_mutex_unlock(&lock_copy);
+
+        // Copy the work array to the main list
+        for (my_index = my_segment_start; my_index < my_segment_end; my_index++) {
+            list[my_index] = work[my_index];
+        }
+
+        // Synchronization for next iteration
+        pthread_mutex_lock(&lock_next);
+        next_count++;
+        if (next_count == num_threads) {
+            next_count = 0;
+            pthread_cond_broadcast(&cond_next);
+        }
+        else {
+            pthread_cond_wait(&cond_next, &lock_next);
+        }
+        pthread_mutex_unlock(&lock_next);
+    }
+
+    return NULL;
+}
+
+
+
 void sort_list(int q) {
 
     int i, level, my_id; 
@@ -204,7 +301,7 @@ int main(int argc, char *argv[]) {
 
     struct timespec start, stop, stop_qsort;
     double total_time, time_res, total_time_qsort;
-    int k, q, j, error; 
+    int k, q, j, error, i; 
 
     // Read input, validate
     if (argc != 3) {
@@ -262,8 +359,26 @@ int main(int argc, char *argv[]) {
 // VS: ... replace this call with multi-threaded parallel routine for merge sort
 // VS: ... need to create threads and execute thread routine that implements 
 // VS: ... parallel merge sort
+    thread_data thread_data_array[num_threads];
 
-    sort_list(q);
+    pthread_mutex_init(&lock_copy, NULL);
+    pthread_mutex_init(&lock_next, NULL);
+    pthread_mutex_init(&lock_start, NULL);
+    pthread_cond_init(&cond_copy, NULL);
+    pthread_cond_init(&cond_next, NULL);
+    pthread_cond_init(&cond_start, NULL);
+
+    for(i = 0; i < num_threads; i++){
+        (thread_data_array[i]).index = i;
+        (thread_data_array[i]).q = q;
+        pthread_create(&p_threads[i], NULL, sort_list_parallel, &thread_data_array[i]);
+    }
+
+    for(i = 0; i < num_threads; i ++){
+        pthread_join(p_threads[i], NULL);
+    }
+    // print_list(list, list_size);
+    // sort_list(q);
 
     // Compute time taken
     clock_gettime(CLOCK_REALTIME, &stop);
@@ -275,7 +390,7 @@ int main(int argc, char *argv[]) {
     clock_gettime(CLOCK_REALTIME, &stop_qsort);
     total_time_qsort = (stop_qsort.tv_sec-stop.tv_sec)
 	+0.000000001*(stop_qsort.tv_nsec-stop.tv_nsec);
-
+    // print_list(list_orig, list_size);
     error = 0; 
     for (j = 1; j < list_size; j++) {
 	if (list[j] != list_orig[j]) error = 1; 
@@ -284,14 +399,22 @@ int main(int argc, char *argv[]) {
     if (error != 0) {
 	printf("Houston, we have a problem!\n"); 
     }
-
+    
     // Print time taken
     printf("List Size = %d, Threads = %d, error = %d, time (sec) = %8.4f, qsort_time = %8.4f\n", 
 	    list_size, num_threads, error, total_time, total_time_qsort);
 
 // VS: ... destroy mutex, condition variables, etc.
+    pthread_mutex_destroy(&lock_copy);
+    pthread_mutex_destroy(&lock_next);
+    pthread_mutex_destroy(&lock_start);
+    pthread_cond_destroy(&cond_copy);
+    pthread_cond_destroy(&cond_next);
+    pthread_cond_destroy(&cond_start);
 
     free(list); free(work); free(list_orig); 
 
 }
 
+
+ 

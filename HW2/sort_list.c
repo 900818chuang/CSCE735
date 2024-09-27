@@ -119,178 +119,86 @@ int binary_search_le(int v, int *list, int first, int last) {
 //
 // VS: ... to be parallelized using threads ...
 //
-void* sort_list_parallel(void* data) {
-    thread_data* my_data = (thread_data*)data;  // my_data
-    int my_thread_id = my_data->index;  // Thread ID
-    int my_merge_level = my_data->q;    // Current merge level
-    int my_segment_size = list_size / num_threads;  // Segment size per thread
-    int my_segment_start = my_thread_id * my_segment_size;  // Start of segment
-    int my_segment_end = (my_thread_id + 1) * my_segment_size;  // End of segment
-    int my_current_start = my_segment_start;  // Current start for merging
-    int my_current_end = my_segment_end;      // Current end for merging
-    int my_index;  // Index for loop
+void* parallel_sort(void* args) { 
+    thread_data* thread_info = (thread_data*)args;
+    int tid = thread_info->index;               // Thread index
+    int merge_depth = thread_info->q;           // Depth of the merge process
+    int chunk_size = list_size / num_threads;   // Size of each segment to sort
+    int start_idx = tid * chunk_size;           // Start of this thread's segment
+    int end_idx = (tid + 1) * chunk_size;       // End of this thread's segment
+    int left_bound = start_idx;
+    int right_bound = end_idx;
 
+    // Sort local segment using quicksort
+    qsort(&list[start_idx], chunk_size, sizeof(int), compare_int);
 
-    // Sort local list
-    qsort(&list[my_thread_id * my_segment_size], my_segment_size, sizeof(int), compare_int);
-
-    // Synchronization for start phase
-    pthread_mutex_lock(&lock_start);
-    start_count++;
-    if (start_count == num_threads) {
-        start_count = 0;
+    // Synchronization at the start phase
+    pthread_mutex_lock(&mutex_start);
+    start_ready++;
+    if (start_ready == num_threads) {
+        start_ready = 0;
         pthread_cond_broadcast(&cond_start);
+    } else {
+        pthread_cond_wait(&cond_start, &mutex_start);
     }
-    else {
-        pthread_cond_wait(&cond_start, &lock_start);
-    }
-    pthread_mutex_unlock(&lock_start);
+    pthread_mutex_unlock(&mutex_start);
 
-    // Merge at each level
-    while (my_merge_level != 0) {
-        if (my_thread_id % 2 == 0) {
-            // Left half merge
-            for (my_index = my_segment_start; my_index < my_segment_end; my_index++) {
-                int my_binary_result = binary_search_lt(list[my_index], list, my_current_start + my_segment_size, my_current_end + my_segment_size);
-                my_binary_result -= (my_current_start + my_segment_size);
-                work[my_index + my_binary_result] = list[my_index];
+    // Merge at each level of depth
+    while (merge_depth > 0) {
+        int is_even_thread = (tid % 2 == 0);
+        
+        if (is_even_thread) {
+            // Merge left half
+            for (int i = start_idx; i < end_idx; i++) {
+                int pos_in_right = binary_search_lt(list[i], list, left_bound + chunk_size, right_bound + chunk_size);
+                int offset = pos_in_right - (left_bound + chunk_size);
+                temp_work[i + offset] = list[i];
             }
-            my_current_end += my_segment_size;
-        }
-        else {
-            // Right half merge
-            for (my_index = my_segment_start; my_index < my_segment_end; my_index++) {
-                int my_binary_result = binary_search_le(list[my_index], list, my_current_start - my_segment_size, my_current_end - my_segment_size);
-                my_binary_result -= (my_current_start - my_segment_size);
-                work[my_index - my_segment_size + my_binary_result] = list[my_index];
+            right_bound += chunk_size;
+        } else {
+            // Merge right half
+            for (int i = start_idx; i < end_idx; i++) {
+                int pos_in_left = binary_search_le(list[i], list, left_bound - chunk_size, right_bound - chunk_size);
+                int offset = pos_in_left - (left_bound - chunk_size);
+                temp_work[i - chunk_size + offset] = list[i];
             }
-            my_current_start -= my_segment_size;
+            left_bound -= chunk_size;
         }
 
-        my_thread_id /= 2;
-        my_segment_size *= 2;
-        my_merge_level--;
+        tid /= 2;
+        chunk_size *= 2;
+        merge_depth--;
 
-        // Synchronization for copy phase
-        pthread_mutex_lock(&lock_copy);
-        copy_count++;
-        if (copy_count == num_threads) {
-            copy_count = 0;
+        // Synchronization for copying phase
+        pthread_mutex_lock(&mutex_copy);
+        copy_ready++;
+        if (copy_ready == num_threads) {
+            copy_ready = 0;
             pthread_cond_broadcast(&cond_copy);
+        } else {
+            pthread_cond_wait(&cond_copy, &mutex_copy);
         }
-        else {
-            pthread_cond_wait(&cond_copy, &lock_copy);
-        }
-        pthread_mutex_unlock(&lock_copy);
+        pthread_mutex_unlock(&mutex_copy);
 
-        // Copy the work array to the main list
-        for (my_index = my_segment_start; my_index < my_segment_end; my_index++) {
-            list[my_index] = work[my_index];
+        // Copy sorted data back to main list
+        for (int i = start_idx; i < end_idx; i++) {
+            list[i] = temp_work[i];
         }
 
-        // Synchronization for next iteration
-        pthread_mutex_lock(&lock_next);
-        next_count++;
-        if (next_count == num_threads) {
-            next_count = 0;
+        // Synchronization for next merge iteration
+        pthread_mutex_lock(&mutex_next);
+        next_ready++;
+        if (next_ready == num_threads) {
+            next_ready = 0;
             pthread_cond_broadcast(&cond_next);
+        } else {
+            pthread_cond_wait(&cond_next, &mutex_next);
         }
-        else {
-            pthread_cond_wait(&cond_next, &lock_next);
-        }
-        pthread_mutex_unlock(&lock_next);
+        pthread_mutex_unlock(&mutex_next);
     }
 
     return NULL;
 }
-
-
-
-void sort_list(int q) {
-
-    int i, level, my_id; 
-    int np, my_list_size; 
-    int ptr[num_threads+1];
-
-    int my_own_blk, my_own_idx;
-    int my_blk_size, my_search_blk, my_search_idx, my_search_idx_max;
-    int my_write_blk, my_write_idx;
-    int my_search_count; 
-    int idx, i_write; 
-    
-    np = list_size/num_threads; 	// Sub list size 
-
-    // Initialize starting position for each sublist
-    for (my_id = 0; my_id < num_threads; my_id++) {
-        ptr[my_id] = my_id * np;
-    }
-    ptr[num_threads] = list_size;
-
-    // Sort local lists
-    for (my_id = 0; my_id < num_threads; my_id++) {
-        my_list_size = ptr[my_id+1]-ptr[my_id];
-        qsort(&list[ptr[my_id]], my_list_size, sizeof(int), compare_int);
-    }
-if (DEBUG) print_list(list, list_size); 
-
-    // Sort list
-    for (level = 0; level < q; level++) {
-
-        // Each thread scatters its sub_list into work array
-	for (my_id = 0; my_id < num_threads; my_id++) {
-
-	    my_blk_size = np * (1 << level); 
-
-	    my_own_blk = ((my_id >> level) << level);
-	    my_own_idx = ptr[my_own_blk];
-
-	    my_search_blk = ((my_id >> level) << level) ^ (1 << level);
-	    my_search_idx = ptr[my_search_blk];
-	    my_search_idx_max = my_search_idx+my_blk_size;
-
-	    my_write_blk = ((my_id >> (level+1)) << (level+1));
-	    my_write_idx = ptr[my_write_blk];
-
-	    idx = my_search_idx;
-	    
-	    my_search_count = 0;
-
-
-	    // Binary search for 1st element
-	    if (my_search_blk > my_own_blk) {
-               idx = binary_search_lt(list[ptr[my_id]], list, my_search_idx, my_search_idx_max); 
-	    } else {
-               idx = binary_search_le(list[ptr[my_id]], list, my_search_idx, my_search_idx_max); 
-	    }
-	    my_search_count = idx - my_search_idx;
-	    i_write = my_write_idx + my_search_count + (ptr[my_id]-my_own_idx); 
-	    work[i_write] = list[ptr[my_id]];
-
-	    // Linear search for 2nd element onwards
-	    for (i = ptr[my_id]+1; i < ptr[my_id+1]; i++) {
-	        if (my_search_blk > my_own_blk) {
-		    while ((list[i] > list[idx]) && (idx < my_search_idx_max)) {
-		        idx++; my_search_count++;
-		    }
-		} else {
-		    while ((list[i] >= list[idx]) && (idx < my_search_idx_max)) {
-		        idx++; my_search_count++;
-		    }
-		}
-		i_write = my_write_idx + my_search_count + (i-my_own_idx); 
-		work[i_write] = list[i];
-	    }
-	}
-        // Copy work into list for next itertion
-	for (my_id = 0; my_id < num_threads; my_id++) {
-	    for (i = ptr[my_id]; i < ptr[my_id+1]; i++) {
-	        list[i] = work[i];
-	    } 
-	}
-if (DEBUG) print_list(list, list_size); 
-    }
-}
-
 // Main program - set up list of random integers and use threads to sort the list
 //
 // Input: 

@@ -10,25 +10,17 @@
 #include <limits.h>
 
 #define MAX_THREADS     65536
-#define MAX_LIST_SIZE   268435460
+#define MAX_LIST_SIZE   300000000
 
 #define DEBUG 0
 
 // Thread variables
 //
-// VS: ... declare thread variables, mutexes, condition varables, etc.,
+// VS: ... declare thread variables, mutexes, condition variables, etc.,
 // VS: ... as needed for this assignment 
 //
-typedef struct Thread_data{
-    int q;
-    int index;
-}thread_data;
-
-pthread_t p_threads[MAX_THREADS];
-pthread_cond_t cond_copy, cond_next, cond_start;
-pthread_mutex_t lock_copy, lock_next, lock_start;
-int copy_count = 0, next_count = 0, start_count = 0;
-
+pthread_barrier_t bar;
+int level_count;
 
 // Global variables
 int num_threads;		// Number of threads to create - user input 
@@ -60,11 +52,11 @@ int compare_int(const void *a0, const void *b0) {
     }
 }
 
-// Return index of first element larger than or equal to v in sorted list
+// Return index of first element greater than or equal to v in sorted list
 // ... return last if all elements are smaller than v
 // ... elements in list[first], list[first+1], ... list[last-1]
 //
-//   int idx = first; while ((v > list[idx]) && (idx < last)) idx++;
+//   int idx = first; while ((v >= list[idx]) && (idx < last)) idx++;
 //
 int binary_search_lt(int v, int *list, int first, int last) {
    
@@ -87,11 +79,11 @@ int binary_search_lt(int v, int *list, int first, int last) {
     }
     return right;
 }
-// Return index of first element larger than v in sorted list
+// Return index of first element greater than v in sorted list
 // ... return last if all elements are smaller than or equal to v
 // ... elements in list[first], list[first+1], ... list[last-1]
 //
-//   int idx = first; while ((v >= list[idx]) && (idx < last)) idx++;
+//   int idx = first; while ((v > list[idx]) && (idx < last)) idx++;
 //
 int binary_search_le(int v, int *list, int first, int last) {
 
@@ -115,90 +107,107 @@ int binary_search_le(int v, int *list, int first, int last) {
     return right;
 }
 
+
 // Sort list via parallel merge sort
 //
 // VS: ... to be parallelized using threads ...
 //
-void* parallel_sort(void* args) { 
-    thread_data* thread_info = (thread_data*)args;
-    int tid = thread_info->index;               // Thread index
-    int merge_depth = thread_info->q;           // Depth of the merge process
-    int chunk_size = list_size / num_threads;   // Size of each segment to sort
-    int start_idx = tid * chunk_size;           // Start of this thread's segment
-    int end_idx = (tid + 1) * chunk_size;       // End of this thread's segment
-    int left_bound = start_idx;
-    int right_bound = end_idx;
+void *sort_list_parallel(void* q) {
 
-    // Sort local segment using quicksort
-    qsort(&list[start_idx], chunk_size, sizeof(int), compare_int);
+    int i, level, my_id; 
+    int np, my_list_size; 
+    int ptr[num_threads+1];
 
-    // Synchronization at the start phase
-    pthread_mutex_lock(&mutex_start);
-    start_ready++;
-    if (start_ready == num_threads) {
-        start_ready = 0;
-        pthread_cond_broadcast(&cond_start);
-    } else {
-        pthread_cond_wait(&cond_start, &mutex_start);
+    int my_own_blk, my_own_idx;
+    int my_blk_size, my_search_blk, my_search_idx, my_search_idx_max;
+    int my_write_blk, my_write_idx;
+    int my_search_count; 
+    int idx, i_write; 
+	int dummy;
+    
+	my_id = q;
+	np = list_size/num_threads; 	// Sub list size 
+
+    // Initialize starting position for each sublist
+	for( dummy = 0; dummy < num_threads; dummy++ )
+	{
+		ptr[dummy] = dummy * np;
+	}
+	
+    ptr[num_threads] = list_size;
+
+    // Sort local lists
+	my_list_size = ptr[my_id+1]-ptr[my_id];
+	qsort(&list[ptr[my_id]], my_list_size, sizeof(int), compare_int);
+	pthread_barrier_wait(&bar);
+	
+if (DEBUG) print_list(list, list_size); 
+
+    // Sort list
+    for (level = 0; level < level_count; level++)
+	{
+
+		// Each thread scatters its sub_list into work array
+		my_blk_size = np * (1 << level); 
+
+		my_own_blk = ((my_id >> level) << level);
+		my_own_idx = ptr[my_own_blk];
+
+		my_search_blk = ((my_id >> level) << level) ^ (1 << level);
+		my_search_idx = ptr[my_search_blk];
+		my_search_idx_max = my_search_idx+my_blk_size;
+
+		my_write_blk = ((my_id >> (level+1)) << (level+1));
+		my_write_idx = ptr[my_write_blk];
+
+		idx = my_search_idx;
+		
+		my_search_count = 0;
+
+
+		// Binary search for 1st element
+		if (my_search_blk > my_own_blk) {
+			   idx = binary_search_lt(list[ptr[my_id]], list, my_search_idx, my_search_idx_max); 
+		} else {
+			   idx = binary_search_le(list[ptr[my_id]], list, my_search_idx, my_search_idx_max); 
+		}
+		my_search_count = idx - my_search_idx;
+		i_write = my_write_idx + my_search_count + (ptr[my_id]-my_own_idx); 
+		work[i_write] = list[ptr[my_id]];
+
+		// Linear search for 2nd element onwards
+		for (i = ptr[my_id]+1; i < ptr[my_id+1]; i++) {
+			if (my_search_blk > my_own_blk) {
+			while ((list[i] > list[idx]) && (idx < my_search_idx_max)) {
+				idx++; my_search_count++;
+			}
+		} else {
+			while ((list[i] >= list[idx]) && (idx < my_search_idx_max)) {
+				idx++; my_search_count++;
+			}
+		}
+		i_write = my_write_idx + my_search_count + (i-my_own_idx); 
+		work[i_write] = list[i];
+		}
+		
+		pthread_barrier_wait(&bar);
+		
+		// Copy work into list for next iteration
+		for (i = ptr[my_id]; i < ptr[my_id+1]; i++)
+		{
+			list[i] = work[i];
+		}
+		
+		pthread_barrier_wait(&bar);
+
+		if (DEBUG) print_list(list, list_size); 
     }
-    pthread_mutex_unlock(&mutex_start);
-
-    // Merge at each level of depth
-    while (merge_depth > 0) {
-        int is_even_thread = (tid % 2 == 0);
-        
-        if (is_even_thread) {
-            // Merge left half
-            for (int i = start_idx; i < end_idx; i++) {
-                int pos_in_right = binary_search_lt(list[i], list, left_bound + chunk_size, right_bound + chunk_size);
-                int offset = pos_in_right - (left_bound + chunk_size);
-                temp_work[i + offset] = list[i];
-            }
-            right_bound += chunk_size;
-        } else {
-            // Merge right half
-            for (int i = start_idx; i < end_idx; i++) {
-                int pos_in_left = binary_search_le(list[i], list, left_bound - chunk_size, right_bound - chunk_size);
-                int offset = pos_in_left - (left_bound - chunk_size);
-                temp_work[i - chunk_size + offset] = list[i];
-            }
-            left_bound -= chunk_size;
-        }
-
-        tid /= 2;
-        chunk_size *= 2;
-        merge_depth--;
-
-        // Synchronization for copying phase
-        pthread_mutex_lock(&mutex_copy);
-        copy_ready++;
-        if (copy_ready == num_threads) {
-            copy_ready = 0;
-            pthread_cond_broadcast(&cond_copy);
-        } else {
-            pthread_cond_wait(&cond_copy, &mutex_copy);
-        }
-        pthread_mutex_unlock(&mutex_copy);
-
-        // Copy sorted data back to main list
-        for (int i = start_idx; i < end_idx; i++) {
-            list[i] = temp_work[i];
-        }
-
-        // Synchronization for next merge iteration
-        pthread_mutex_lock(&mutex_next);
-        next_ready++;
-        if (next_ready == num_threads) {
-            next_ready = 0;
-            pthread_cond_broadcast(&cond_next);
-        } else {
-            pthread_cond_wait(&cond_next, &mutex_next);
-        }
-        pthread_mutex_unlock(&mutex_next);
-    }
-
-    return NULL;
+	
+	pthread_exit(NULL);
 }
+
+
+
 // Main program - set up list of random integers and use threads to sort the list
 //
 // Input: 
@@ -209,7 +218,7 @@ int main(int argc, char *argv[]) {
 
     struct timespec start, stop, stop_qsort;
     double total_time, time_res, total_time_qsort;
-    int k, q, j, error, i; 
+    int k, q, j, error; 
 
     // Read input, validate
     if (argc != 3) {
@@ -263,30 +272,43 @@ int main(int argc, char *argv[]) {
 // VS: ... may need to initialize mutexes, condition variables, and their attributes
 //
 
+	level_count = q;
+	pthread_t th_arr[num_threads];
+	pthread_attr_t att;
+	pthread_attr_init(&att);
+	int index;
+
 // Serial merge sort 
 // VS: ... replace this call with multi-threaded parallel routine for merge sort
 // VS: ... need to create threads and execute thread routine that implements 
 // VS: ... parallel merge sort
-    thread_data thread_data_array[num_threads];
 
-    pthread_mutex_init(&lock_copy, NULL);
-    pthread_mutex_init(&lock_next, NULL);
-    pthread_mutex_init(&lock_start, NULL);
-    pthread_cond_init(&cond_copy, NULL);
-    pthread_cond_init(&cond_next, NULL);
-    pthread_cond_init(&cond_start, NULL);
-
-    for(i = 0; i < num_threads; i++){
-        (thread_data_array[i]).index = i;
-        (thread_data_array[i]).q = q;
-        pthread_create(&p_threads[i], NULL, sort_list_parallel, &thread_data_array[i]);
-    }
-
-    for(i = 0; i < num_threads; i ++){
-        pthread_join(p_threads[i], NULL);
-    }
-    // print_list(list, list_size);
-    // sort_list(q);
+	pthread_attr_setdetachstate(&att, PTHREAD_CREATE_JOINABLE);
+	pthread_barrier_init(&bar, NULL, num_threads);
+	
+	for( index = 0; index < (num_threads/2); index++ )
+	{
+		pthread_create( &th_arr[index], &att, sort_list_parallel, (void*)index );
+	}
+	
+	index = (num_threads/2);
+	
+	while( index < num_threads )
+	{
+		pthread_create(&th_arr[index], &att, sort_list_parallel, (void*)index);
+		index++;
+	}
+	
+	pthread_attr_destroy(&att);
+	
+	index = 0;
+	do
+	{
+		pthread_join(th_arr[index], NULL);
+		index++;
+	}while(index < num_threads);
+	
+	pthread_barrier_destroy(&bar);
 
     // Compute time taken
     clock_gettime(CLOCK_REALTIME, &stop);
@@ -298,7 +320,7 @@ int main(int argc, char *argv[]) {
     clock_gettime(CLOCK_REALTIME, &stop_qsort);
     total_time_qsort = (stop_qsort.tv_sec-stop.tv_sec)
 	+0.000000001*(stop_qsort.tv_nsec-stop.tv_nsec);
-    // print_list(list_orig, list_size);
+
     error = 0; 
     for (j = 1; j < list_size; j++) {
 	if (list[j] != list_orig[j]) error = 1; 
@@ -307,22 +329,13 @@ int main(int argc, char *argv[]) {
     if (error != 0) {
 	printf("Houston, we have a problem!\n"); 
     }
-    
+
     // Print time taken
     printf("List Size = %d, Threads = %d, error = %d, time (sec) = %8.4f, qsort_time = %8.4f\n", 
 	    list_size, num_threads, error, total_time, total_time_qsort);
 
 // VS: ... destroy mutex, condition variables, etc.
-    pthread_mutex_destroy(&lock_copy);
-    pthread_mutex_destroy(&lock_next);
-    pthread_mutex_destroy(&lock_start);
-    pthread_cond_destroy(&cond_copy);
-    pthread_cond_destroy(&cond_next);
-    pthread_cond_destroy(&cond_start);
 
-    free(list); free(work); free(list_orig); 
-
+    free(list); free(work); free(list_orig);
+	pthread_exit(NULL);
 }
-
-
- 
